@@ -40,6 +40,9 @@ static const struct libmpv_gpu_next_context_fns *context_backends[] = {
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
     &libmpv_gpu_next_context_d3d11,
 #endif
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    &libmpv_gpu_next_context_vulkan,
+#endif
     NULL
 };
 
@@ -141,11 +144,13 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     // Render the video frame.
     pl_video_render(p->video_engine, frame, target_tex);
 
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &target_tex);
-
+    // done_frame fires before texture destruction — Vulkan backends need
+    // this ordering to hold the image back before the wrapper is freed.
     if (p->context->fns->done_frame)
         p->context->fns->done_frame(p->context);
+
+    // Destroy the temporary wrapper texture via the RA.
+    ra_next_tex_destroy(p->context->ra, &target_tex);
 
     return 0;
 }

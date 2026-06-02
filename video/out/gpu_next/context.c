@@ -21,6 +21,11 @@
 #include <libplacebo/d3d11.h>
 #endif
 
+#ifdef PL_HAVE_VULKAN
+#include <libplacebo/vulkan.h>
+#include "mpv/render_vulkan.h"
+#endif
+
 #ifdef PL_HAVE_OPENGL
 #include <libplacebo/opengl.h>
 #include "mpv/render_gl.h"
@@ -472,5 +477,132 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
     .wrap_fbo = libmpv_gpu_next_wrap_fbo_d3d11,
     .done_frame = libmpv_gpu_next_done_frame_d3d11,
     .destroy = libmpv_gpu_next_destroy_d3d11,
+};
+#endif
+
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+
+struct priv_vulkan {
+    pl_log pl_log;
+    pl_vulkan vulkan;
+    pl_gpu gpu;
+    struct ra_next *ra;
+    pl_tex current_tex;  // stored by wrap_fbo, held in done_frame before destroy
+};
+
+static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
+{
+    ctx->priv = talloc_zero(NULL, struct priv_vulkan);
+    struct priv_vulkan *p = ctx->priv;
+
+    mpv_vulkan_init_params *vk_params =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, NULL);
+    if (!vk_params || !vk_params->instance || !vk_params->phys_device || !vk_params->device)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    struct pl_log_params log_params = {
+        .log_level = PL_LOG_DEBUG
+    };
+    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+
+    p->vulkan = pl_vulkan_import(p->pl_log, pl_vulkan_import_params(
+        .instance   = (VkInstance) vk_params->instance,
+        .get_proc_addr = (PFN_vkGetInstanceProcAddr) vk_params->get_proc_addr,
+        .phys_device = (VkPhysicalDevice) vk_params->phys_device,
+        .device      = (VkDevice) vk_params->device,
+        .queue_graphics = {
+            .index = vk_params->queue_family_index,
+            .count = 1,
+        },
+    ));
+    if (!p->vulkan) {
+        MP_ERR(ctx, "Failed to import Vulkan device via libplacebo.\n");
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->gpu = p->vulkan->gpu;
+
+    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
+    if (!p->ra) {
+        pl_vulkan_destroy(&p->vulkan);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    ctx->ra = p->ra;
+    ctx->gpu = p->gpu;
+    return 0;
+}
+
+static int libmpv_gpu_next_wrap_fbo_vulkan(struct libmpv_gpu_next_context *ctx,
+                    mpv_render_param *params, pl_tex *out_tex)
+{
+    struct priv_vulkan *p = ctx->priv;
+    *out_tex = NULL;
+
+    mpv_vulkan_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_FBO, NULL);
+    if (!fbo || !fbo->image)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    pl_tex tex = pl_vulkan_wrap(p->gpu, pl_vulkan_wrap_params(
+        .image  = (VkImage) fbo->image,
+        .width  = fbo->w,
+        .height = fbo->h,
+        .format = (VkFormat) fbo->format,
+        .usage  = (VkImageUsageFlags) fbo->usage,
+    ));
+    if (!tex) {
+        MP_ERR(ctx, "Failed to wrap VkImage as a libplacebo texture.\n");
+        return MPV_ERROR_GENERIC;
+    }
+
+    // The wrapped texture starts "held" (user-visible layout).  Release it
+    // to libplacebo so the render engine can write to it.
+    pl_vulkan_release_ex(p->gpu, pl_vulkan_release_params(
+        .tex    = tex,
+        .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .qf     = VK_QUEUE_FAMILY_IGNORED,
+    ));
+
+    // Store for done_frame so we can hold it back before the wrapper is freed.
+    p->current_tex = tex;
+
+    *out_tex = tex;
+    return 0;
+}
+
+static void libmpv_gpu_next_done_frame_vulkan(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_vulkan *p = ctx->priv;
+
+    // Synchronous drain — ensures all GPU work is done before the wrapper
+    // texture is destroyed.  The host (Qt) will transition the swapchain
+    // image layout for presentation; we don't need to hold it back.
+    pl_gpu_finish(p->gpu);
+    p->current_tex = NULL;
+}
+
+static void libmpv_gpu_next_destroy_vulkan(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_vulkan *p = ctx->priv;
+    if (!p)
+        return;
+
+    if (p->ra)
+        ra_pl_destroy(&p->ra);
+
+    if (p->vulkan)
+        pl_vulkan_destroy(&p->vulkan);
+
+    pl_log_destroy(&p->pl_log);
+}
+
+const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_vulkan = {
+    .api_name   = MPV_RENDER_API_TYPE_VULKAN,
+    .init       = libmpv_gpu_next_init_vulkan,
+    .wrap_fbo   = libmpv_gpu_next_wrap_fbo_vulkan,
+    .done_frame = libmpv_gpu_next_done_frame_vulkan,
+    .destroy    = libmpv_gpu_next_destroy_vulkan,
 };
 #endif
