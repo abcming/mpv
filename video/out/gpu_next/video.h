@@ -4,6 +4,7 @@
 #include <libplacebo/gpu.h>  // for pl_gpu, pl_tex
 
 // Forward declarations
+struct m_config_cache;
 struct mp_image_params;
 struct mp_log;
 struct mp_osd_res;
@@ -16,7 +17,8 @@ struct vo_frame;
 /**
  * Initializes the rendering engine.
  */
-struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, struct ra_next *ra);
+struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
+                              struct ra_next *ra);
 
 /**
  * Shuts down and destroys the rendering engine.
