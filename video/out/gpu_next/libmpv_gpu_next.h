@@ -79,3 +79,4 @@ struct libmpv_gpu_next_context_fns {
  */
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_gl;
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11;
+extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_vulkan;
