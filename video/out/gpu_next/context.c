@@ -23,12 +23,16 @@
 
 #ifdef PL_HAVE_OPENGL
 #include <libplacebo/opengl.h>
+#include "mpv/render_gl.h"
+#include "video/out/gpu_next/libmpv_gpu_next.h"
+#include "video/out/gpu_next/ra.h"
 #endif
 
 #include "context.h"
 #include "config.h"
 #include "common/common.h"
 #include "options/m_config.h"
+#include "video/out/libmpv.h"
 #include "video/out/placebo/utils.h"
 #include "video/out/gpu/video.h"
 
@@ -234,3 +238,239 @@ skip_common_pl_cleanup:
     talloc_free(ctx);
     *ctxp = NULL;
 }
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+
+struct priv {
+    pl_log pl_log;
+    pl_opengl gl;
+    pl_gpu gpu;
+    struct ra_next *ra;
+    mpv_opengl_init_params gl_params;
+};
+
+static bool pl_callback_makecurrent_gl(void *priv)
+{
+    mpv_opengl_init_params *gl_params = priv;
+    if (gl_params && gl_params->get_proc_address) {
+        gl_params->get_proc_address(gl_params->get_proc_address_ctx, "glGetString");
+        return true;
+    }
+    return false;
+}
+
+static void pl_callback_releasecurrent_gl(void *priv)
+{
+}
+
+static void pl_log_cb(void *log_priv, enum pl_log_level level, const char *msg)
+{
+    struct mp_log *log = log_priv;
+    mp_msg(log, MSGL_WARN, "[gpu-next:pl] %s\n", msg);
+}
+
+static int libmpv_gpu_next_init_gl(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
+{
+    ctx->priv = talloc_zero(NULL, struct priv);
+    struct priv *p = ctx->priv;
+
+    mpv_opengl_init_params *gl_params =
+    get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, NULL);
+    if (!gl_params || !gl_params->get_proc_address)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    p->gl_params = *gl_params;
+
+    struct pl_log_params log_params = {
+        .log_level = PL_LOG_DEBUG
+    };
+
+    if (mp_msg_test(ctx->log, MSGL_TRACE)) {
+        log_params.log_cb = pl_log_cb;
+        log_params.log_priv = ctx->log;
+    }
+
+    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+    p->gl = pl_opengl_create(p->pl_log, pl_opengl_params(
+        .get_proc_addr_ex = (pl_voidfunc_t (*)(void*, const char*))gl_params->get_proc_address,
+        .proc_ctx = gl_params->get_proc_address_ctx,
+        .make_current = pl_callback_makecurrent_gl,
+        .release_current = pl_callback_releasecurrent_gl,
+        .priv = &p->gl_params
+    ));
+
+    if (!p->gl) {
+        MP_ERR(ctx, "Failed to create libplacebo OpenGL context.\n");
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->gpu = p->gl->gpu;
+
+    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
+    if (!p->ra) {
+        pl_opengl_destroy(&p->gl);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    ctx->ra = p->ra;
+    ctx->gpu = p->gpu;
+    return 0;
+}
+
+static int libmpv_gpu_next_wrap_fbo_gl(struct libmpv_gpu_next_context *ctx,
+                    mpv_render_param *params, pl_tex *out_tex)
+{
+    struct priv *p = ctx->priv;
+    *out_tex = NULL;
+
+    mpv_opengl_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
+    if (!fbo)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    pl_tex tex = pl_opengl_wrap(p->gpu, pl_opengl_wrap_params(
+        .framebuffer = fbo->fbo,
+        .width = fbo->w,
+        .height = fbo->h,
+        .iformat = fbo->internal_format
+    ));
+
+    if (!tex) {
+        MP_ERR(ctx, "Failed to wrap provided FBO as a libplacebo texture.\n");
+        return MPV_ERROR_GENERIC;
+    }
+
+    *out_tex = tex;
+    return 0;
+}
+
+static void libmpv_gpu_next_done_frame_gl(struct libmpv_gpu_next_context *ctx)
+{
+}
+
+static void libmpv_gpu_next_destroy_gl(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv *p = ctx->priv;
+    if (!p)
+        return;
+
+    if (p->ra) {
+        ra_pl_destroy(&p->ra);
+    }
+
+    pl_opengl_destroy(&p->gl);
+    pl_log_destroy(&p->pl_log);
+}
+
+const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_gl = {
+    .api_name = MPV_RENDER_API_TYPE_OPENGL,
+    .init = libmpv_gpu_next_init_gl,
+    .wrap_fbo = libmpv_gpu_next_wrap_fbo_gl,
+    .done_frame = libmpv_gpu_next_done_frame_gl,
+    .destroy = libmpv_gpu_next_destroy_gl,
+};
+#endif
+
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+
+#include <mpv/render_d3d11.h>
+
+struct priv_d3d11 {
+    pl_log pl_log;
+    pl_d3d11 d3d11;
+    pl_gpu gpu;
+    struct ra_next *ra;
+};
+
+static int libmpv_gpu_next_init_d3d11(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
+{
+    ctx->priv = talloc_zero(NULL, struct priv_d3d11);
+    struct priv_d3d11 *p = ctx->priv;
+
+    mpv_d3d11_init_params *d3d11_params =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_D3D11_INIT_PARAMS, NULL);
+    if (!d3d11_params || !d3d11_params->device)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    struct pl_log_params log_params = {
+        .log_level = PL_LOG_DEBUG
+    };
+    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+
+    p->d3d11 = pl_d3d11_create(p->pl_log, pl_d3d11_params(
+        .device = d3d11_params->device
+    ));
+    if (!p->d3d11) {
+        MP_ERR(ctx, "Failed to create libplacebo D3D11 context.\n");
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->gpu = p->d3d11->gpu;
+
+    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
+    if (!p->ra) {
+        pl_d3d11_destroy(&p->d3d11);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    ctx->ra = p->ra;
+    ctx->gpu = p->gpu;
+    return 0;
+}
+
+static int libmpv_gpu_next_wrap_fbo_d3d11(struct libmpv_gpu_next_context *ctx,
+                    mpv_render_param *params, pl_tex *out_tex)
+{
+    struct priv_d3d11 *p = ctx->priv;
+    *out_tex = NULL;
+
+    mpv_d3d11_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_D3D11_FBO, NULL);
+    if (!fbo || !fbo->tex)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    pl_tex tex = pl_d3d11_wrap(p->gpu, pl_d3d11_wrap_params(
+        .tex = fbo->tex,
+        .w = fbo->w,
+        .h = fbo->h
+    ));
+
+    if (!tex) {
+        MP_ERR(ctx, "Failed to wrap provided D3D11 texture as a libplacebo texture.\n");
+        return MPV_ERROR_GENERIC;
+    }
+
+    *out_tex = tex;
+    return 0;
+}
+
+static void libmpv_gpu_next_done_frame_d3d11(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_d3d11 *p = ctx->priv;
+    pl_gpu_flush(p->gpu);
+}
+
+static void libmpv_gpu_next_destroy_d3d11(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_d3d11 *p = ctx->priv;
+    if (!p)
+        return;
+
+    if (p->ra) {
+        ra_pl_destroy(&p->ra);
+    }
+
+    pl_d3d11_destroy(&p->d3d11);
+    pl_log_destroy(&p->pl_log);
+}
+
+const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_d3d11 = {
+    .api_name = MPV_RENDER_API_TYPE_D3D11,
+    .init = libmpv_gpu_next_init_d3d11,
+    .wrap_fbo = libmpv_gpu_next_wrap_fbo_d3d11,
+    .done_frame = libmpv_gpu_next_done_frame_d3d11,
+    .destroy = libmpv_gpu_next_destroy_d3d11,
+};
+#endif

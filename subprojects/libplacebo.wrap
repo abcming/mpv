@@ -1,0 +1,6 @@
+[wrap-git]
+url = https://code.videolan.org/videolan/libplacebo.git
+depth = 1
+
+[provide]
+libplacebo = libplacebo_dep
