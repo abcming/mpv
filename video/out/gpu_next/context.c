@@ -500,6 +500,14 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
     if (!vk_params || !vk_params->instance || !vk_params->phys_device || !vk_params->device)
         return MPV_ERROR_INVALID_PARAMETER;
 
+    MP_INFO(ctx, "Vulkan init params:\n");
+    MP_INFO(ctx, "  instance:    %p\n", vk_params->instance);
+    MP_INFO(ctx, "  phys_device: %p\n", vk_params->phys_device);
+    MP_INFO(ctx, "  device:      %p\n", vk_params->device);
+    MP_INFO(ctx, "  proc_addr:   %p\n", vk_params->get_proc_addr);
+    MP_INFO(ctx, "  qf_index:    %u\n", vk_params->queue_family_index);
+    MP_INFO(ctx, "  q_index:     %u\n", vk_params->queue_index);
+
     struct pl_log_params log_params = {
         .log_level = PL_LOG_DEBUG,
         .log_cb    = pl_log_cb,
@@ -507,9 +515,14 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
     };
     p->pl_log = pl_log_create(PL_API_VER, &log_params);
 
+    // Try with the caller-supplied get_proc_addr first. If libplacebo
+    // rejects it, we fall back to NULL (let libplacebo use the Vulkan
+    // loader directly) — this is safe because PL_HAVE_VK_PROC_ADDR
+    // means we link vulkan-1.dll.
+    PFN_vkGetInstanceProcAddr gpa = (PFN_vkGetInstanceProcAddr) vk_params->get_proc_addr;
     p->vulkan = pl_vulkan_import(p->pl_log, pl_vulkan_import_params(
         .instance   = (VkInstance) vk_params->instance,
-        .get_proc_addr = (PFN_vkGetInstanceProcAddr) vk_params->get_proc_addr,
+        .get_proc_addr = gpa ? gpa : NULL,
         .phys_device = (VkPhysicalDevice) vk_params->phys_device,
         .device      = (VkDevice) vk_params->device,
         .queue_graphics = {
@@ -517,6 +530,22 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
             .count = 1,
         },
     ));
+    if (!p->vulkan && gpa) {
+        // If it failed with the caller's proc_addr, try again with
+        // NULL to let libplacebo use the native vkGetInstanceProcAddr.
+        MP_WARN(ctx, "Vulkan import with caller proc_addr failed; "
+                "retrying with native vkGetInstanceProcAddr...\n");
+        p->vulkan = pl_vulkan_import(p->pl_log, pl_vulkan_import_params(
+            .instance   = (VkInstance) vk_params->instance,
+            .get_proc_addr = NULL,
+            .phys_device = (VkPhysicalDevice) vk_params->phys_device,
+            .device      = (VkDevice) vk_params->device,
+            .queue_graphics = {
+                .index = vk_params->queue_family_index,
+                .count = 1,
+            },
+        ));
+    }
     if (!p->vulkan) {
         MP_ERR(ctx, "Failed to import Vulkan device via libplacebo.\n");
         pl_log_destroy(&p->pl_log);
