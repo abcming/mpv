@@ -501,7 +501,9 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
         return MPV_ERROR_INVALID_PARAMETER;
 
     struct pl_log_params log_params = {
-        .log_level = PL_LOG_DEBUG
+        .log_level = PL_LOG_DEBUG,
+        .log_cb    = pl_log_cb,
+        .log_priv  = ctx->log,
     };
     p->pl_log = pl_log_create(PL_API_VER, &log_params);
 
