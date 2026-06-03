@@ -100,6 +100,8 @@ struct pl_video {
     struct pl_color_map_params color_map;
     struct pl_dither_params dither;
     struct pl_color_adjustment color_adj;
+    enum pl_color_levels output_levels;
+    uint64_t osd_sync;               // global OSD version — incremented on resize/reset
 };
 
 /**
@@ -108,6 +110,8 @@ struct pl_video {
  */
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
+    struct pl_video_osd_state subs;  // per-frame subtitle overlay state
+    uint64_t osd_sync;               // OSD version when this frame's subs were last built
 };
 
 // ── Forward declarations ──
@@ -300,6 +304,7 @@ static void update_render_options(struct pl_video *p)
             .scene_threshold_low = opts->tone_map.scene_threshold_low,
             .scene_threshold_high = opts->tone_map.scene_threshold_high,
             .percentile = opts->tone_map.peak_percentile,
+            .allow_delayed = true,
         };
         p->render_params.peak_detect_params = &p->peak_detect;
     } else {
@@ -367,6 +372,7 @@ static void update_options(struct pl_video *p)
     p->color_adj.hue        = cparams.hue;
     p->color_adj.saturation = cparams.saturation;
     p->color_adj.gamma      = cparams.gamma * opts->gamma;
+    p->output_levels = cparams.levels_out;
 }
 
 /**
@@ -397,6 +403,21 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     // Store a pointer back to the original mp_image. This is used to get a unique
     // signature for the frame and to access metadata (like colorspace) later.
     frame->user_data = mpi;
+
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    // treat_srgb_as_power22: Linearize sRGB to pure gamma 2.2 (input side).
+    // The sRGB EOTF is a pure gamma 2.2 function, see IEC 61966-2-1-1999.
+    if (opts->treat_srgb_as_power22 & 1 && frame->color.transfer == PL_COLOR_TRC_SRGB)
+        frame->color.transfer = PL_COLOR_TRC_GAMMA22;
+
+    // hdr_reference_white: Map SDR content white point when outputting to HDR.
+    if (opts->hdr_reference_white && !pl_color_transfer_is_hdr(frame->color.transfer))
+        frame->color.hdr.max_luma = opts->hdr_reference_white;
+
+    // Set chroma location from source params for correct YUV subsampling.
+    pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
+
     return true;
 }
 
@@ -415,6 +436,13 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
+
+    // Return per-frame OSD textures to the pool for reuse
+    for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
+        pl_tex tex = fp->subs.entries[i].tex;
+        if (tex)
+            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
+    }
 
     // Use the RA helper to destroy the GPU textures associated with the frame.
     ra_cleanup_pl_frame(p->ra, frame);
@@ -632,6 +660,23 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
         .repr = pl_color_repr_rgb,
     };
 
+    // Apply output levels (TV/PC) from color equalizer
+    if (p->output_levels)
+        target_frame.repr.levels = p->output_levels;
+
+    // Apply target contrast (black level)
+    if (opts->target_contrast == -1) {
+        target_frame.color.hdr.min_luma = 1e-7; // infinite contrast
+    } else if (opts->target_contrast > 0) {
+        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+            .color    = &target_frame.color,
+            .metadata = PL_HDR_METADATA_HDR10,
+            .scaling  = PL_HDR_NITS,
+            .out_max  = &target_frame.color.hdr.max_luma,
+        ));
+        target_frame.color.hdr.min_luma = target_frame.color.hdr.max_luma / opts->target_contrast;
+    }
+
     // The libmpv VO provides one new frame at a time in frame->current.
     // We check the frame_id to avoid pushing duplicates.
     if (frame && frame->current && frame->frame_id > p->last_frame_id) {
@@ -658,8 +703,19 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     double target_pts = (frame && frame->current) ? frame->current->pts : p->last_pts;
     p->last_pts = target_pts;
 
+    // Compute display-sync interpolation parameters for the frame queue.
+    bool can_interpolate = frame && opts->interpolation && frame->display_synced &&
+                           !frame->still && frame->num_frames > 1;
+    double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
+
     struct pl_frame_mix queue_mix = {0};
-    struct pl_queue_params qparams = *pl_queue_params(.pts = target_pts);
+    struct pl_queue_params qparams = *pl_queue_params(
+        .pts = target_pts + pts_offset,
+        .radius = pl_frame_mix_radius(&p->render_params),
+        .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
+        .interpolation_threshold = opts->interpolation_threshold,
+        .drift_compensation = 0,
+    );
 
     ra_next_queue_update(p->queue, &queue_mix, &qparams);
 
@@ -679,13 +735,53 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     struct pl_frame_mix mix = queue_mix;
     mix.signatures = signatures;
 
-    // Generate and attach OSD overlays to the target frame.
-    update_overlays(p, p->osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
+    // ── OSD on target frame ──
+    // When blend_subs is enabled, only render OSD (seek bar etc.) on target;
+    // subtitles are rendered onto each source frame below.
+    int target_osd_flags = (opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0;
+    update_overlays(p, p->osd_res, target_osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
                    &p->osd_state_storage, &target_frame, representative_img);
 
-    // For a simple, non-interpolating backend, we can assume the display
-    // frame's duration is equivalent to one source frame (1.0 in normalized time).
-    mix.vsync_duration = 1.0f;
+    // ── Blend subtitles onto source frames ──
+    if (opts->blend_subs) {
+        for (int i = 0; i < mix.num_frames; i++) {
+            struct pl_frame *image = (struct pl_frame *) mix.frames[i];
+            struct mp_image *mpi = image->user_data;
+            struct frame_priv *fp = mpi->priv;
+
+            if (fp->osd_sync < p->osd_sync) {
+                // OSD coordinate space:
+                //   blend_subs=video → source frame coords (SRC_CROP)
+                //   blend_subs=yes   → target/dst coords (DST_CROP)
+                float w = (opts->blend_subs == BLEND_SUBS_VIDEO)
+                          ? pl_rect_w(image->crop) : pl_rect_w(target_frame.crop);
+                float h = (opts->blend_subs == BLEND_SUBS_VIDEO)
+                          ? pl_rect_h(image->crop) : pl_rect_h(target_frame.crop);
+                struct mp_osd_res src_osd_res = {
+                    .w = w, .h = h, .display_par = 1.0,
+                };
+                enum pl_overlay_coords rel =
+                    (opts->blend_subs == BLEND_SUBS_VIDEO)
+                    ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
+
+                update_overlays(p, src_osd_res, OSD_DRAW_SUB_ONLY,
+                               rel, &fp->subs, image, mpi);
+                fp->osd_sync = p->osd_sync;
+            }
+
+            // Mix osd_sync into frame signature so subtitle changes bust the cache
+            ((uint64_t *) mix.signatures)[i] ^= fp->osd_sync << 48;
+        }
+    } else {
+        // blend_subs disabled: clear per-frame overlays
+        for (int i = 0; i < mix.num_frames; i++) {
+            struct pl_frame *image = (struct pl_frame *) mix.frames[i];
+            struct frame_priv *fp =
+                ((struct mp_image *) image->user_data)->priv;
+            image->num_overlays = 0;
+            fp->osd_sync = 0;
+        }
+    }
 
     // Use dynamically-built render params from mpv options
     struct pl_render_params params = p->render_params;
@@ -823,6 +919,7 @@ void pl_video_resize(struct pl_video *p, const struct mp_rect *dst, const struct
         p->current_dst = *dst;
     if (osd)
         p->osd_res = *osd;
+    p->osd_sync++;
 }
 
 /**
@@ -844,6 +941,7 @@ void pl_video_reset(struct pl_video *p) {
     ra_next_queue_reset(p->queue); // Also reset the frame queue.
     p->last_frame_id = 0;
     p->last_pts = 0;
+    p->osd_sync++;
 }
 
 /**
