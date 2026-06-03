@@ -519,12 +519,28 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
     // rejects it, we fall back to NULL (let libplacebo use the Vulkan
     // loader directly) — this is safe because PL_HAVE_VK_PROC_ADDR
     // means we link vulkan-1.dll.
+    //
+    // Qt's QRhi creates the VkDevice with a minimal feature set. libplacebo
+    // requires VkPhysicalDeviceVulkan12Features (hostQueryReset and
+    // timelineSemaphore). Declare them here so vk_features_normalize chains
+    // them into the output for check_required_features.
+    VkPhysicalDeviceVulkan12Features vk12 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .hostQueryReset = VK_TRUE,
+        .timelineSemaphore = VK_TRUE,
+    };
+    VkPhysicalDeviceFeatures2 vkfeat = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &vk12,
+    };
+
     PFN_vkGetInstanceProcAddr gpa = (PFN_vkGetInstanceProcAddr) vk_params->get_proc_addr;
     p->vulkan = pl_vulkan_import(p->pl_log, pl_vulkan_import_params(
         .instance   = (VkInstance) vk_params->instance,
         .get_proc_addr = gpa ? gpa : NULL,
         .phys_device = (VkPhysicalDevice) vk_params->phys_device,
         .device      = (VkDevice) vk_params->device,
+        .features    = &vkfeat,
         .queue_graphics = {
             .index = vk_params->queue_family_index,
             .count = 1,
@@ -544,6 +560,7 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
                 .index = vk_params->queue_family_index,
                 .count = 1,
             },
+            .features = &vkfeat,
         ));
     }
     if (!p->vulkan) {
