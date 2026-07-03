@@ -487,7 +487,39 @@ struct priv_vulkan {
     pl_vulkan vulkan;
     pl_gpu gpu;
     struct ra_next *ra;
-    pl_tex current_tex;  // stored by wrap_fbo, held in done_frame before destroy
+    // Wrapper around the caller's VkImage, cached across frames instead of
+    // rewrapped/destroyed every frame (see wrap_fbo/done_frame_vulkan below
+    // for why: destroying it every frame requires a synchronous GPU drain
+    // to avoid freeing a view the GPU is still using, which is what used to
+    // make this backend's frame pacing track the video's GPU render time
+    // instead of the display's). Recreated only when the caller hands us a
+    // different VkImage (i.e. on resize).
+    pl_tex wrapped_tex;
+    VkImage wrapped_image;
+    // Whether wrapped_tex is currently "held" (user side owns it). Tracked
+    // here because release_ex on an unheld image is an error, and wrap_fbo
+    // can run without a matching done_frame (get_target_size).
+    bool wrapped_held;
+    // The caller's fbo param for the in-progress render call; done_frame
+    // reports the post-render image layout into its out_layout field. Only
+    // valid for the duration of one mpv_render_context_render() call.
+    mpv_vulkan_fbo *current_fbo;
+    // Satisfies pl_vulkan_hold_ex's mandatory semaphore param (see
+    // done_frame_vulkan). Timeline semaphore so re-signalling it every frame
+    // needs no reset/consume step like a binary semaphore would.
+    VkSemaphore hold_sem;
+    uint64_t hold_sem_value;
+    // Write-after-read guard (see wrap_fbo): signalled by an empty submit
+    // whose implicit first sync scope covers everything earlier in this
+    // queue's submission order — i.e. the host's last blit that read the
+    // image — and waited on by libplacebo (via release_ex) before it writes.
+    VkSemaphore guard_sem;
+    uint64_t guard_sem_value;
+    // Raw queue access for the guard submit. The host shares one VkQueue
+    // with us (init params), and all submissions happen on its render
+    // thread, so no cross-thread locking is needed here.
+    VkQueue queue;
+    PFN_vkQueueSubmit fp_queue_submit;
 };
 
 static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
@@ -520,10 +552,18 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
     // loader directly) — this is safe because PL_HAVE_VK_PROC_ADDR
     // means we link vulkan-1.dll.
     //
-    // Qt's QRhi creates the VkDevice with a minimal feature set. libplacebo
-    // requires VkPhysicalDeviceVulkan12Features (hostQueryReset and
-    // timelineSemaphore). Declare them here so vk_features_normalize chains
-    // them into the output for check_required_features.
+    // Feature declaration: pl_vulkan_import loads functions of extensions
+    // promoted to core purely by the device's apiVersion — but promoted-to-
+    // core does not mean feature-enabled (synchronization2, pushDescriptor
+    // are separate device features). Using them on a device created without
+    // those features is undefined behavior (observed as random
+    // VK_ERROR_DEVICE_LOST on NVIDIA).
+    //
+    // If the caller tells us what the device was actually created with
+    // (enabled_features), pass that through verbatim. Otherwise assume the
+    // bare libplacebo-required minimum (hostQueryReset + timelineSemaphore)
+    // and cap the API version at 1.2 so libplacebo never picks up promoted
+    // 1.3/1.4 entry points implicitly.
     VkPhysicalDeviceVulkan12Features vk12 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .hostQueryReset = VK_TRUE,
@@ -533,6 +573,10 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext = &vk12,
     };
+    const VkPhysicalDeviceFeatures2 *features = vk_params->enabled_features
+        ? (const VkPhysicalDeviceFeatures2 *) vk_params->enabled_features
+        : &vkfeat;
+    uint32_t max_api_ver = vk_params->enabled_features ? 0 : VK_API_VERSION_1_2;
 
     PFN_vkGetInstanceProcAddr gpa = (PFN_vkGetInstanceProcAddr) vk_params->get_proc_addr;
     p->vulkan = pl_vulkan_import(p->pl_log, pl_vulkan_import_params(
@@ -540,7 +584,10 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
         .get_proc_addr = gpa ? gpa : NULL,
         .phys_device = (VkPhysicalDevice) vk_params->phys_device,
         .device      = (VkDevice) vk_params->device,
-        .features    = &vkfeat,
+        .features    = features,
+        .extensions  = vk_params->enabled_extensions,
+        .num_extensions = (int) vk_params->num_enabled_extensions,
+        .max_api_version = max_api_ver,
         .queue_graphics = {
             .index = vk_params->queue_family_index,
             .count = 1,
@@ -560,7 +607,10 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
                 .index = vk_params->queue_family_index,
                 .count = 1,
             },
-            .features = &vkfeat,
+            .features = features,
+            .extensions  = vk_params->enabled_extensions,
+            .num_extensions = (int) vk_params->num_enabled_extensions,
+            .max_api_version = max_api_ver,
         ));
     }
     if (!p->vulkan) {
@@ -572,6 +622,41 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
 
     p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
     if (!p->ra) {
+        pl_vulkan_destroy(&p->vulkan);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    p->hold_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
+        .type = VK_SEMAPHORE_TYPE_TIMELINE,
+    ));
+    p->guard_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
+        .type = VK_SEMAPHORE_TYPE_TIMELINE,
+    ));
+
+    // Queue handle + submit fn for the guard submit in wrap_fbo. gpa may be
+    // NULL (the retry path above); PL_HAVE_VK_PROC_ADDR guarantees we link
+    // the Vulkan loader, so fall back to the native entry point.
+    PFN_vkGetInstanceProcAddr gipa = gpa ? gpa : vkGetInstanceProcAddr;
+    VkDevice dev = (VkDevice) vk_params->device;
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)
+        gipa((VkInstance) vk_params->instance, "vkGetDeviceProcAddr");
+    PFN_vkGetDeviceQueue get_queue = gdpa
+        ? (PFN_vkGetDeviceQueue) gdpa(dev, "vkGetDeviceQueue") : NULL;
+    p->fp_queue_submit = gdpa
+        ? (PFN_vkQueueSubmit) gdpa(dev, "vkQueueSubmit") : NULL;
+    if (get_queue) {
+        get_queue(dev, vk_params->queue_family_index, vk_params->queue_index,
+                  &p->queue);
+    }
+
+    if (!p->hold_sem || !p->guard_sem || !p->queue || !p->fp_queue_submit) {
+        MP_ERR(ctx, "Failed to set up Vulkan interop sync objects.\n");
+        if (p->hold_sem)
+            pl_vulkan_sem_destroy(p->gpu, &p->hold_sem);
+        if (p->guard_sem)
+            pl_vulkan_sem_destroy(p->gpu, &p->guard_sem);
+        ra_pl_destroy(&p->ra);
         pl_vulkan_destroy(&p->vulkan);
         pl_log_destroy(&p->pl_log);
         return MPV_ERROR_VO_INIT_FAILED;
@@ -593,42 +678,107 @@ static int libmpv_gpu_next_wrap_fbo_vulkan(struct libmpv_gpu_next_context *ctx,
     if (!fbo || !fbo->image)
         return MPV_ERROR_INVALID_PARAMETER;
 
-    pl_tex tex = pl_vulkan_wrap(p->gpu, pl_vulkan_wrap_params(
-        .image  = (VkImage) fbo->image,
-        .width  = fbo->w,
-        .height = fbo->h,
-        .format = (VkFormat) fbo->format,
-        .usage  = (VkImageUsageFlags) fbo->usage,
-    ));
-    if (!tex) {
-        MP_ERR(ctx, "Failed to wrap VkImage as a libplacebo texture.\n");
-        return MPV_ERROR_GENERIC;
+    VkImage image = (VkImage) fbo->image;
+
+    if (p->wrapped_tex && p->wrapped_image != image) {
+        // Caller handed us a different VkImage than last frame (a resize).
+        // The outgoing wrapper's view must not be freed while GPU work from
+        // the last frame might still reference it — drain first. This is a
+        // resize-only cost, not a per-frame one.
+        pl_gpu_finish(p->gpu);
+        pl_tex_destroy(p->gpu, &p->wrapped_tex);
+        p->wrapped_image = VK_NULL_HANDLE;
+        p->wrapped_held = false;
     }
 
-    // The wrapped texture starts "held" (user-visible layout).  Release it
-    // to libplacebo so the render engine can write to it.
-    pl_vulkan_release_ex(p->gpu, pl_vulkan_release_params(
-        .tex    = tex,
-        .layout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .qf     = VK_QUEUE_FAMILY_IGNORED,
-    ));
+    if (!p->wrapped_tex) {
+        pl_tex tex = pl_vulkan_wrap(p->gpu, pl_vulkan_wrap_params(
+            .image  = image,
+            .width  = fbo->w,
+            .height = fbo->h,
+            .format = (VkFormat) fbo->format,
+            .usage  = (VkImageUsageFlags) fbo->usage,
+        ));
+        if (!tex) {
+            MP_ERR(ctx, "Failed to wrap VkImage as a libplacebo texture.\n");
+            return MPV_ERROR_GENERIC;
+        }
+        p->wrapped_tex = tex;
+        p->wrapped_image = image;
+        p->wrapped_held = true; // freshly wrapped images start held
+    }
 
-    // Store for done_frame so we can hold it back before the wrapper is freed.
-    p->current_tex = tex;
+    if (p->wrapped_held) {
+        // Write-after-read guard: the host's blit that reads this image
+        // lives in a command buffer submitted *after* our render (Qt
+        // records its frame in one buffer, submitted at frame end). Without
+        // a wait, libplacebo's first write barrier next frame has an empty
+        // src scope and can overlap that still-executing read — UB. An
+        // empty submit's signal op happens-after everything earlier in this
+        // queue's submission order (which by now includes the host's frame
+        // containing the blit), so releasing against it orders our next
+        // write after that read. No CPU wait anywhere.
+        p->guard_sem_value++;
+        VkTimelineSemaphoreSubmitInfo tsinfo = {
+            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            .signalSemaphoreValueCount = 1,
+            .pSignalSemaphoreValues = &p->guard_sem_value,
+        };
+        VkSubmitInfo sinfo = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = &tsinfo,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &p->guard_sem,
+        };
+        p->fp_queue_submit(p->queue, 1, &sinfo, VK_NULL_HANDLE);
 
-    *out_tex = tex;
+        pl_vulkan_release_ex(p->gpu, pl_vulkan_release_params(
+            .tex       = p->wrapped_tex,
+            .layout    = VK_IMAGE_LAYOUT_UNDEFINED,
+            .qf        = VK_QUEUE_FAMILY_IGNORED,
+            .semaphore = { p->guard_sem, p->guard_sem_value },
+        ));
+        p->wrapped_held = false;
+    }
+
+    p->current_fbo = fbo;
+    *out_tex = p->wrapped_tex;
     return 0;
 }
 
 static void libmpv_gpu_next_done_frame_vulkan(struct libmpv_gpu_next_context *ctx)
 {
     struct priv_vulkan *p = ctx->priv;
+    if (!p->wrapped_tex || p->wrapped_held)
+        return;
 
-    // Synchronous drain — ensures all GPU work is done before the wrapper
-    // texture is destroyed.  The host (Qt) will transition the swapchain
-    // image layout for presentation; we don't need to hold it back.
-    pl_gpu_finish(p->gpu);
-    p->current_tex = NULL;
+    // Reclaim the image WITHOUT a layout transition (out_layout mode: query
+    // the current layout instead of transitioning to one) and report that
+    // layout to the caller via fbo->out_layout. Deliberately no transition
+    // here: a transition recorded by libplacebo lives in *our* command
+    // buffer, and its barrier's dst scope is empty (upstream hold_ex
+    // semantics) — a host that can't wait on `semaphore` (Qt owns its own
+    // vkQueueSubmit) has no way to order its read after that transition,
+    // which is UB and crashed NVIDIA drivers in practice. By only reporting
+    // the layout, the host performs the transition in its own command
+    // buffer, in the same submission as its read — trivially ordered, no
+    // cross-submission barrier chaining needed at all. This also submits
+    // any still-buffered render commands (hold_ex ends and submits the
+    // active command buffer). hold_sem exists purely to satisfy hold_ex's
+    // mandatory semaphore param; nothing waits on it.
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    p->hold_sem_value++;
+    p->wrapped_held = pl_vulkan_hold_ex(p->gpu, pl_vulkan_hold_params(
+        .tex        = p->wrapped_tex,
+        .out_layout = &layout,
+        .qf         = VK_QUEUE_FAMILY_IGNORED,
+        .semaphore  = { p->hold_sem, p->hold_sem_value },
+    ));
+
+    if (p->current_fbo) {
+        p->current_fbo->out_layout = (int) layout;
+        p->current_fbo = NULL;
+    }
 }
 
 static void libmpv_gpu_next_destroy_vulkan(struct libmpv_gpu_next_context *ctx)
@@ -636,6 +786,19 @@ static void libmpv_gpu_next_destroy_vulkan(struct libmpv_gpu_next_context *ctx)
     struct priv_vulkan *p = ctx->priv;
     if (!p)
         return;
+
+    if (p->wrapped_tex) {
+        // Teardown isn't a hot path — a hard drain here to make sure no GPU
+        // work still references the wrapper's view is fine (this replaces
+        // the per-frame pl_gpu_finish() this backend used to do).
+        pl_gpu_finish(p->gpu);
+        pl_tex_destroy(p->gpu, &p->wrapped_tex);
+    }
+
+    if (p->hold_sem)
+        pl_vulkan_sem_destroy(p->gpu, &p->hold_sem);
+    if (p->guard_sem)
+        pl_vulkan_sem_destroy(p->gpu, &p->guard_sem);
 
     if (p->ra)
         ra_pl_destroy(&p->ra);
@@ -652,5 +815,6 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_vulkan = {
     .wrap_fbo   = libmpv_gpu_next_wrap_fbo_vulkan,
     .done_frame = libmpv_gpu_next_done_frame_vulkan,
     .destroy    = libmpv_gpu_next_destroy_vulkan,
+    .persistent_target_tex = true,
 };
 #endif

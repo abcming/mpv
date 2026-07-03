@@ -49,9 +49,10 @@ struct libmpv_gpu_next_context_fns {
      * that our engine can understand.
      * @param ctx The context instance.
      * @param params The list of parameters from the user, containing the target.
-     * @param out_tex On success, this will point to a newly created, temporary
-     *                `pl_tex` that wraps the user's target. The caller is
-     *                responsible for freeing this texture.
+     * @param out_tex On success, this will point to a `pl_tex` that wraps the
+     *                user's target. Unless `persistent_target_tex` is set, this
+     *                is a newly created, temporary texture and the caller is
+     *                responsible for freeing it after this frame.
      * @return 0 on success, or a negative mpv_error code.
      */
     int (*wrap_fbo)(struct libmpv_gpu_next_context *ctx,
@@ -70,6 +71,17 @@ struct libmpv_gpu_next_context_fns {
      * @param ctx The context instance to destroy.
      */
     void (*destroy)(struct libmpv_gpu_next_context *ctx);
+
+    /**
+     * If true, the texture `wrap_fbo` returns is owned and cached by the
+     * backend across frames (keyed on the underlying native handle) instead
+     * of being a fresh, single-frame wrapper. The Host must not destroy it
+     * after each frame; the backend frees it in `destroy`. Backends set this
+     * when destroying and re-wrapping the target every frame would risk
+     * freeing a view the GPU hasn't finished using yet (see the Vulkan
+     * backend, which drops the per-frame synchronous GPU drain this avoids).
+     */
+    bool persistent_target_tex;
 };
 
 /**
