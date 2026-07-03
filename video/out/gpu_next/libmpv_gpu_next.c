@@ -149,8 +149,11 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (p->context->fns->done_frame)
         p->context->fns->done_frame(p->context);
 
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &target_tex);
+    // Backends with persistent_target_tex own target_tex across frames (see
+    // libmpv_gpu_next.h) and free it themselves in destroy(); destroying it
+    // here would race whatever GPU work this frame's render just submitted.
+    if (!p->context->fns->persistent_target_tex)
+        ra_next_tex_destroy(p->context->ra, &target_tex);
 
     return 0;
 }
@@ -235,8 +238,9 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
     if (!tex) return MPV_ERROR_GENERIC;
     *out_w = tex->params.w;
     *out_h = tex->params.h;
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &tex);
+    // See render(): persistent_target_tex backends own this across frames.
+    if (!p->context->fns->persistent_target_tex)
+        ra_next_tex_destroy(p->context->ra, &tex);
     return 0;
 }
 
