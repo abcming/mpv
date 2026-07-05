@@ -680,8 +680,14 @@ static int libmpv_gpu_next_wrap_fbo_vulkan(struct libmpv_gpu_next_context *ctx,
 
     VkImage image = (VkImage) fbo->image;
 
-    if (p->wrapped_tex && p->wrapped_image != image) {
+    if (p->wrapped_tex && (p->wrapped_image != image ||
+                           p->wrapped_tex->params.w != fbo->w ||
+                           p->wrapped_tex->params.h != fbo->h)) {
         // Caller handed us a different VkImage than last frame (a resize).
+        // The size check guards against handle reuse: if the caller destroyed
+        // its image and the driver gave the replacement the same handle value,
+        // the cached wrapper's view references the destroyed image — trust the
+        // handle alone and we render through a dead view (device lost).
         // The outgoing wrapper's view must not be freed while GPU work from
         // the last frame might still reference it — drain first. This is a
         // resize-only cost, not a per-frame one.
