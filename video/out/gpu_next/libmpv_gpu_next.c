@@ -300,6 +300,12 @@ static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
 static void perfdata(struct render_backend *ctx,
                      struct voctrl_performance_data *out)
 {
+    // Pass timing collection is not implemented for this backend, but the
+    // caller (mp_property_vo_passes) hands us an UNINITIALIZED struct and
+    // trusts whatever we leave in it — vo_libmpv reports VO_TRUE whenever
+    // this hook exists. Leaving it unwritten means garbage pass counts and
+    // an out-of-bounds crash the moment the stats script queries vo-passes.
+    *out = (struct voctrl_performance_data){0};
 }
 
 const struct render_backend_fns render_backend_gpu_next = {
