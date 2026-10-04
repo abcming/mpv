@@ -398,10 +398,10 @@ static int libmpv_gpu_next_init_d3d11(struct libmpv_gpu_next_context *ctx, mpv_r
     if (!d3d11_params || !d3d11_params->device)
         return MPV_ERROR_INVALID_PARAMETER;
 
-    struct pl_log_params log_params = {
-        .log_level = PL_LOG_DEBUG
-    };
-    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+    // Route libplacebo through mpv's logger with proper level mapping
+    // (a bare pl_log without callback silently drops everything, including
+    // "Spent N ms compiling shader" timings).
+    p->pl_log = mppl_log_create(p, ctx->log);
 
     p->d3d11 = pl_d3d11_create(p->pl_log, pl_d3d11_params(
         .device = d3d11_params->device
@@ -540,12 +540,9 @@ static int libmpv_gpu_next_init_vulkan(struct libmpv_gpu_next_context *ctx, mpv_
     MP_INFO(ctx, "  qf_index:    %u\n", vk_params->queue_family_index);
     MP_INFO(ctx, "  q_index:     %u\n", vk_params->queue_index);
 
-    struct pl_log_params log_params = {
-        .log_level = PL_LOG_DEBUG,
-        .log_cb    = pl_log_cb,
-        .log_priv  = ctx->log,
-    };
-    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+    // mpv's logger maps libplacebo levels properly; pl_log_cb forwards
+    // every message (debug included) as a warning.
+    p->pl_log = mppl_log_create(p, ctx->log);
 
     // Try with the caller-supplied get_proc_addr first. If libplacebo
     // rejects it, we fall back to NULL (let libplacebo use the Vulkan
