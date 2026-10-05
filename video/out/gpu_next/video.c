@@ -651,6 +651,24 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
         target_csp.transfer = opts->target_trc;
     if (opts->target_peak)
         target_csp.hdr.max_luma = opts->target_peak;
+    // SDR output: pass the source's SDR transfer through instead of converting
+    // BT.1886 (~gamma 2.4) to sRGB, same rule as vo_gpu_next with
+    // sdr-adjust-gamma=auto. Converting crushes shadows (0.1 -> ~0.05) and
+    // looks far darker than any other player on an SDR display.
+    if (target_csp.transfer == PL_COLOR_TRC_SRGB && frame && frame->current &&
+        ((opts->sdr_adjust_gamma == 0 && opts->target_trc == PL_COLOR_TRC_UNKNOWN) ||
+         opts->sdr_adjust_gamma == -1))
+    {
+        switch (frame->current->params.color.transfer) {
+        case PL_COLOR_TRC_BT_1886:
+        case PL_COLOR_TRC_GAMMA22:
+        case PL_COLOR_TRC_SRGB:
+            target_csp.transfer = frame->current->params.color.transfer;
+            break;
+        default:
+            break;
+        }
+    }
 
     struct pl_frame target_frame = {
         .num_planes = 1,
