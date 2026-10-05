@@ -804,6 +804,13 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // Use dynamically-built render params from mpv options
     struct pl_render_params params = p->render_params;
     params.color_adjustment = &p->color_adj;
+    // Letterboxing makes libplacebo clear the target via pl_tex_clear(), which
+    // requires blit_dst. A wrapped D3D11 render target (the host's backbuffer)
+    // doesn't have it: the clear fails validation every frame, and each
+    // failure logs an error with a symbolized backtrace (~45 ms on Windows),
+    // capping the host UI at video frame rate. The host clears its backbuffer
+    // itself, so skip the clear when the target can't take it.
+    params.skip_target_clearing |= !target_tex->params.blit_dst;
 
     // Render the mix. libplacebo handles the empty mix case (no video) correctly.
     if (!ra_next_render_image_mix(p->ra, &mix, &target_frame, &params)) {
